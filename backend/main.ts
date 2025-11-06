@@ -1,14 +1,16 @@
+import { ServerWebSocket } from "bun";
+
 type Message = [Date, any];
 
 const channels: Map<string, Channel> = new Map();
 
-function attemptSend(socket: WebSocket, data: string) {
-  if (socket.readyState === WebSocket.OPEN) socket.send(data);
+function attemptSend(socket: ServerWebSocket<{ url: string }>, data: string) {
+  socket.send(data);
 }
 
 class Channel {
   topic: string;
-  listeners: Set<WebSocket> = new Set();
+  listeners: Set<ServerWebSocket<{ url: string }>> = new Set();
   messages: Message[] = [];
 
   constructor(topic: string) {
@@ -28,15 +30,15 @@ class Channel {
     this.listeners.forEach((l) => attemptSend(l, JSON.stringify({ cl: true })));
   }
 
-  onOpen(socket: WebSocket) {
+  onOpen(socket: ServerWebSocket<{ url: string }>) {
     this.listeners.add(socket);
     attemptSend(socket, JSON.stringify(this.messages));
     this._sendCounts();
   }
 
-  onClose(socket: WebSocket) {
+  onClose(socket: ServerWebSocket<{ url: string }>) {
     this.listeners.delete(socket);
-    if (this.listeners.size === 0) channels.delete(this.url);
+    if (this.listeners.size === 0) channels.delete(socket.data.url);
     else this._sendCounts();
   }
 
@@ -47,30 +49,55 @@ class Channel {
 }
 
 setInterval(() => {
-    channels.forEach((channel) => channel._sendCounts());
+  channels.forEach((channel) => channel._sendCounts());
 }, 15000);
 
-Deno.serve({ port: 8084 }, (req) => {
-  const { socket, response } = Deno.upgradeWebSocket(req);
-  const channel = channels.get(req.url) || new Channel(req.url);
-  channels.set(req.url, channel);
-  socket.addEventListener("open", () => channel.onOpen(socket));
-  socket.addEventListener("close", () => channel.onClose(socket));
-  socket.addEventListener("message", (evt) => {
-    if (evt.data.length > 1048576) socket.close(1009, "Message too long");
-    try {
-      let payload = evt.data;
-      if (typeof payload === "string") {
-        const json = JSON.parse(payload);
-        if (json.clear) channel.clear();
-        else channel.post(json);
-      } else {
-          const b64 = btoa(String.fromCharCode(...new Uint8Array(payload)));
-          channel.post(b64);
-      }
-    } catch (err) {
-      socket.close(1007, "Failure: " + err.message);
+Bun.serve({
+  port: 8084,
+  fetch(req, server) {
+    const url = new URL(req.url).pathname;
+    if (server.upgrade(req, { data: { url } })) {
+      return;
     }
-  });
-  return response;
+    return new Response("Upgrade failed", { status: 500 });
+  },
+  websocket: {
+    open(ws) {
+      const url = ws.data.url;
+      const channel = channels.get(url) || new Channel(url);
+      channels.set(url, channel);
+      channel.onOpen(ws);
+    },
+    message(ws, message) {
+      const url = ws.data.url;
+      const channel = channels.get(url);
+      if (!channel) return;
+
+      if (typeof message === "string") {
+        if (message.length > 1048576) {
+          ws.close(1009, "Message too long");
+          return;
+        }
+        try {
+          const json = JSON.parse(message);
+          if (json.clear) channel.clear();
+          else channel.post(json);
+        } catch (err: any) {
+          ws.close(1007, "Failure: " + err.message);
+        }
+      } else {
+        if (message.byteLength > 1048576) {
+          ws.close(1009, "Message too long");
+          return;
+        }
+        const b64 = btoa(String.fromCharCode(...new Uint8Array(message as ArrayBuffer)));
+        channel.post(b64);
+      }
+    },
+    close(ws) {
+      const url = ws.data.url;
+      const channel = channels.get(url);
+      if (channel) channel.onClose(ws);
+    },
+  },
 });
