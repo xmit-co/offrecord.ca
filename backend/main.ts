@@ -38,8 +38,7 @@ class Channel {
 
   onClose(socket: ServerWebSocket<{ url: string }>) {
     this.listeners.delete(socket);
-    if (this.listeners.size === 0) channels.delete(socket.data.url);
-    else this._sendCounts();
+    if (this.listeners.size > 0) this._sendCounts();
   }
 
   _sendCounts() {
@@ -51,6 +50,15 @@ class Channel {
 setInterval(() => {
   channels.forEach((channel) => channel._sendCounts());
 }, 15000);
+
+setInterval(() => {
+  const oneMinuteAgo = new Date(Date.now() - 60000);
+  let messageCount = 0;
+  channels.forEach((channel) => {
+    messageCount += channel.messages.filter((msg) => msg[0] > oneMinuteAgo).length;
+  });
+  console.log(`Messages in last minute: ${messageCount}`);
+}, 60000);
 
 Bun.serve({
   port: 8084,
