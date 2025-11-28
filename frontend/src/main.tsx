@@ -7,6 +7,7 @@ import Sockette from "sockette";
 import * as nacl from "tweetnacl";
 import { decode, encode } from "cbor-x";
 import { Renderer, parse } from "marked";
+import DOMPurify from "dompurify";
 import { useEffect, useRef } from "preact/hooks";
 import QRCode from "qrcode";
 
@@ -158,13 +159,15 @@ const App = () => {
         </dt>
         <dd
           dangerouslySetInnerHTML={{
-            __html: parse(json[1], {
-              async: false,
-              pedantic: false,
-              gfm: true,
-              breaks: true,
-              renderer,
-            }),
+            __html: DOMPurify.sanitize(
+              parse(json[1], {
+                async: false,
+                pedantic: false,
+                gfm: true,
+                breaks: true,
+                renderer,
+              })
+            ),
           }}
         />
       </>
