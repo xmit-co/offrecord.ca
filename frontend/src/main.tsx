@@ -128,7 +128,9 @@ const App = () => {
       });
   }, [qr, s.zoomCanvas, location.href]);
 
-  useEffect(() => msg.current?.focus(), [msg]);
+  useEffect(() => {
+    if (window.self === window.top) msg.current?.focus();
+  }, [msg]);
 
   const messageView = s.msgs.map((msg) => {
     if (!s.boxKP) return <></>;
