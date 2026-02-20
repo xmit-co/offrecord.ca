@@ -30,6 +30,13 @@ class Channel {
     this.listeners.forEach((l) => attemptSend(l, JSON.stringify({ cl: true })));
   }
 
+  relay(payload: any, sender: ServerWebSocket<{ url: string }>) {
+    const json = JSON.stringify(payload);
+    this.listeners.forEach((l) => {
+      if (l !== sender) attemptSend(l, json);
+    });
+  }
+
   onOpen(socket: ServerWebSocket<{ url: string }>) {
     this.listeners.add(socket);
     attemptSend(socket, JSON.stringify(this.messages));
@@ -89,6 +96,7 @@ Bun.serve({
         try {
           const json = JSON.parse(message);
           if (json.clear) channel.clear();
+          else if (json.sig !== undefined) channel.relay(json, ws);
           else channel.post(json);
         } catch (err: any) {
           ws.close(1007, "Failure: " + err.message);

@@ -27,6 +27,29 @@ renderer.image = ({ href, title, text }) => {
   return `![${text}](${href})`;
 };
 
+// WebRTC constants
+const ICE_SERVERS: RTCConfiguration = {
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+};
+const peerId = Math.random().toString(36).substring(2);
+const peerConnections = new Map<string, RTCPeerConnection>();
+let localStream: MediaStream | null = null;
+
+interface State {
+  pass?: string;
+  boxKP?: nacl.BoxKeyPair;
+  chan?: string;
+  count?: number;
+  sock?: Sockette;
+  msgs: [string, string][];
+  pending: [string, string];
+  zoomCanvas: boolean;
+  inCall: boolean;
+  remoteStreams: Record<string, MediaStream>;
+  audioEnabled: boolean;
+  videoEnabled: boolean;
+}
+
 const state = signal<State>({
   msgs: [],
   pending: [
@@ -38,6 +61,10 @@ const state = signal<State>({
     "",
   ],
   zoomCanvas: false,
+  inCall: false,
+  remoteStreams: {},
+  audioEnabled: true,
+  videoEnabled: true,
 });
 
 addEventListener("hashchange", reconnect);
@@ -46,6 +73,240 @@ reconnect().catch(console.error);
 function randomChannelName() {
   return btoa(String.fromCharCode(...nacl.randomBytes(64))).replace(/=/g, "");
 }
+
+// Signaling helpers
+
+function encryptSignal(data: any): string {
+  const s = state.value;
+  if (!s.boxKP) throw new Error("No key pair");
+  const nonce = nacl.randomBytes(nacl.box.nonceLength);
+  const payload = nacl.box(
+    new TextEncoder().encode(JSON.stringify(data)),
+    nonce,
+    s.boxKP.publicKey,
+    s.boxKP.secretKey
+  );
+  return btoa(String.fromCharCode(...encode([nonce, payload])));
+}
+
+function decryptSignal(b64: string): any {
+  const s = state.value;
+  if (!s.boxKP) return null;
+  try {
+    const [nonce, payload] = decode(
+      Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
+    );
+    const raw = nacl.box.open(
+      payload,
+      nonce,
+      s.boxKP.publicKey,
+      s.boxKP.secretKey
+    );
+    if (!raw) return null;
+    return JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return null;
+  }
+}
+
+function sendSignal(data: any) {
+  state.value.sock?.json({ sig: encryptSignal(data) });
+}
+
+// Peer connection management
+
+function createPeerConnection(remotePid: string): RTCPeerConnection {
+  const pc = new RTCPeerConnection(ICE_SERVERS);
+  peerConnections.set(remotePid, pc);
+
+  if (localStream) {
+    localStream
+      .getTracks()
+      .forEach((track) => pc.addTrack(track, localStream!));
+  }
+
+  pc.ontrack = (evt) => {
+    const stream = evt.streams[0] || new MediaStream([evt.track]);
+    state.value = {
+      ...state.value,
+      remoteStreams: { ...state.value.remoteStreams, [remotePid]: stream },
+    };
+  };
+
+  pc.onicecandidate = (evt) => {
+    if (evt.candidate) {
+      sendSignal({
+        t: "ice",
+        from: peerId,
+        to: remotePid,
+        candidate: evt.candidate,
+      });
+    }
+  };
+
+  let disconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  pc.oniceconnectionstatechange = () => {
+    if (pc.iceConnectionState === "disconnected") {
+      disconnectTimer = setTimeout(() => removePeer(remotePid), 5000);
+    } else if (
+      pc.iceConnectionState === "connected" ||
+      pc.iceConnectionState === "completed"
+    ) {
+      if (disconnectTimer) {
+        clearTimeout(disconnectTimer);
+        disconnectTimer = null;
+      }
+    } else if (
+      pc.iceConnectionState === "failed" ||
+      pc.iceConnectionState === "closed"
+    ) {
+      if (disconnectTimer) clearTimeout(disconnectTimer);
+      removePeer(remotePid);
+    }
+  };
+
+  return pc;
+}
+
+function removePeer(remotePid: string) {
+  const pc = peerConnections.get(remotePid);
+  if (pc) {
+    pc.close();
+    peerConnections.delete(remotePid);
+  }
+  const { [remotePid]: _, ...rest } = state.value.remoteStreams;
+  state.value = { ...state.value, remoteStreams: rest };
+}
+
+function teardownCall() {
+  peerConnections.forEach((pc) => pc.close());
+  peerConnections.clear();
+  if (localStream) {
+    localStream.getTracks().forEach((t) => t.stop());
+    localStream = null;
+  }
+  state.value = {
+    ...state.value,
+    inCall: false,
+    remoteStreams: {},
+    audioEnabled: true,
+    videoEnabled: true,
+  };
+}
+
+// Call actions
+
+async function joinCall() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: true,
+    });
+  } catch {
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false,
+      });
+      state.value = { ...state.value, videoEnabled: false };
+    } catch {
+      alert("Could not access microphone or camera.");
+      return;
+    }
+  }
+  state.value = { ...state.value, inCall: true };
+  sendSignal({ t: "join", from: peerId });
+}
+
+function leaveCall() {
+  sendSignal({ t: "leave", from: peerId });
+  teardownCall();
+}
+
+function toggleAudio() {
+  if (!localStream) return;
+  const enabled = !state.value.audioEnabled;
+  localStream.getAudioTracks().forEach((t) => (t.enabled = enabled));
+  state.value = { ...state.value, audioEnabled: enabled };
+}
+
+function toggleVideo() {
+  if (!localStream) return;
+  const enabled = !state.value.videoEnabled;
+  localStream.getVideoTracks().forEach((t) => (t.enabled = enabled));
+  state.value = { ...state.value, videoEnabled: enabled };
+}
+
+// Signal handler (perfect negotiation: lower peerId = polite)
+
+async function handleSignal(sig: any) {
+  const { t, from, to } = sig;
+
+  if (from === peerId) return;
+  if (to && to !== peerId) return;
+
+  switch (t) {
+    case "join": {
+      if (!state.value.inCall) return;
+      if (peerConnections.has(from)) removePeer(from);
+      const pc = createPeerConnection(from);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      sendSignal({
+        t: "offer",
+        from: peerId,
+        to: from,
+        sdp: pc.localDescription,
+      });
+      break;
+    }
+    case "leave": {
+      removePeer(from);
+      break;
+    }
+    case "offer": {
+      let pc = peerConnections.get(from);
+      if (!pc) {
+        if (!state.value.inCall) return;
+        pc = createPeerConnection(from);
+      }
+      const polite = peerId < from;
+      const collision = pc.signalingState !== "stable";
+      if (!polite && collision) return;
+      await pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      sendSignal({
+        t: "answer",
+        from: peerId,
+        to: from,
+        sdp: pc.localDescription,
+      });
+      break;
+    }
+    case "answer": {
+      const pc = peerConnections.get(from);
+      if (!pc) return;
+      await pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
+      break;
+    }
+    case "ice": {
+      const pc = peerConnections.get(from);
+      if (!pc) return;
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(sig.candidate));
+      } catch {}
+      break;
+    }
+  }
+}
+
+// Send leave signal on tab close
+addEventListener("beforeunload", () => {
+  if (state.value.inCall) {
+    sendSignal({ t: "leave", from: peerId });
+  }
+});
 
 async function reconnect() {
   const pass = location.hash.slice(1);
@@ -72,9 +333,11 @@ async function reconnect() {
 
   const previous = state.value.chan;
   if (previous !== chan) {
+    if (state.value.inCall) leaveCall();
     state.value.sock?.close();
     const sock = new Sockette(`wss://${window.location.host}/ws/${chan}`, {
       onreconnect: () => {
+        teardownCall();
         state.value = { ...state.value, msgs: [], count: undefined };
       },
       onmessage: (evt) => {
@@ -83,6 +346,9 @@ async function reconnect() {
           state.value = { ...state.value, msgs: [] };
         } else if (payload.ct) {
           state.value = { ...state.value, count: payload.ct };
+        } else if (payload.sig !== undefined) {
+          const sig = decryptSignal(payload.sig);
+          if (sig) handleSignal(sig);
         } else {
           state.value = {
             ...state.value,
@@ -103,15 +369,18 @@ async function reconnect() {
   }
 }
 
-interface State {
-  pass?: string;
-  boxKP?: nacl.BoxKeyPair;
-  chan?: string;
-  count?: number;
-  sock?: Sockette;
-  msgs: [string, string][];
-  pending: [string, string];
-  zoomCanvas: boolean;
+function Video({
+  stream,
+  muted,
+}: {
+  stream: MediaStream;
+  muted?: boolean;
+}) {
+  const ref = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    if (ref.current) ref.current.srcObject = stream;
+  }, [stream]);
+  return <video ref={ref} autoPlay playsInline muted={muted} />;
 }
 
 const App = () => {
@@ -210,7 +479,12 @@ const App = () => {
           <button onClick={() => (location.hash = randomChannelName())}>
             random
           </button>
-          <button onClick={() => (location.hash = "#lobby")}>lobby</button>{" "}
+          <button onClick={() => (location.hash = "#lobby")}>lobby</button>
+          {s.inCall ? (
+            <button onClick={leaveCall}>hang up</button>
+          ) : (
+            <button onClick={joinCall}>call</button>
+          )}
         </p>
         {s.count !== undefined && <p id="count">{s.count} online</p>}
         <canvas
@@ -221,6 +495,35 @@ const App = () => {
           }}
         />
       </header>
+      {s.inCall && (
+        <section id="call">
+          <div id="call-controls">
+            <button onClick={toggleAudio}>
+              {s.audioEnabled ? "mute" : "unmute"}
+            </button>
+            <button onClick={toggleVideo}>
+              {s.videoEnabled ? "cam off" : "cam on"}
+            </button>
+          </div>
+          <div
+            id="call-videos"
+            style={{
+              "--video-cols": Math.ceil(
+                Math.sqrt(
+                  (localStream ? 1 : 0) + Object.keys(s.remoteStreams).length
+                )
+              ),
+            } as any}
+          >
+            {localStream && s.videoEnabled && (
+              <Video stream={localStream} muted />
+            )}
+            {Object.entries(s.remoteStreams).map(([pid, stream]) => (
+              <Video key={pid} stream={stream} />
+            ))}
+          </div>
+        </section>
+      )}
       <main>
         <dl>{messageView}</dl>
         <article>
